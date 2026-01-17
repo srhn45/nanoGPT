@@ -9,4 +9,8 @@ __pycache__/
 *.pyc
 input.txt
 env/
-venv/
+venv/data/enwik8/enwik8.bin
+data/enwik8/train.bin
+data/enwik8/val.bin
+data/enwik8/test.bin
+data/enwik8/meta.pkl
