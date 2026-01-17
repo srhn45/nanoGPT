@@ -14,3 +14,4 @@ data/enwik8/train.bin
 data/enwik8/val.bin
 data/enwik8/test.bin
 data/enwik8/meta.pkl
+.venv/
