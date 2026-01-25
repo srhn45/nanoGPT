@@ -1,3 +1,12 @@
+"""
+Full definition of a GPT Language Model, all of it in this single file.
+References:
+1) the official GPT-2 TensorFlow implementation released by OpenAI:
+https://github.com/openai/gpt-2/blob/master/src/model.py
+2) huggingface/transformers PyTorch implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+"""
+
 import math
 import inspect
 from dataclasses import dataclass
@@ -9,22 +18,18 @@ from torch.nn import functional as F
 from hyperblock import HyperBlock
 from hyperconnections import get_init_and_expand_reduce_stream_functions
 from modules import RMSNorm
-
     
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = False
-    num_streams: int = 4
-    use_swiglu: bool = True  # Use SwiGLU instead of GELU MLP
-    swiglu_hidden_factor: int = None  # None = use 8/3 ratio
-    num_fracs: int = 4
-
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    num_streams: int = 12
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -33,9 +38,9 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # Get hyper connection functions
         init_hyper_conn_fn, expand_fn, reduce_fn = get_init_and_expand_reduce_stream_functions(
             num_streams=config.num_streams,
-            num_fracs=config.num_fracs,
             dim=config.n_embd,
             add_stream_embed=False,
             disable=None
@@ -51,38 +56,41 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([HyperBlock(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd, bias=config.bias),
+            ln_f = RMSNorm(config.n_embd, bias=config.bias),  # Changed from LayerNorm to RMSNorm
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # Weight tying
         self.transformer.wte.weight = self.lm_head.weight
+            
 
+        # init all weights
         self.apply(self._init_weights)
-        
-        # Apply special scaled init to the residual projections, per GPT-2 paper
+        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # Report number of parameters
+        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        
-        # Forward the GPT model itself
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         
         # Fan out to multiple streams at the beginning
-        x = self.expand_fn(x)
+        x = self.expand_fn(tok_emb + pos_emb)
         
         x = self.transformer.drop(x)
         
+        # Pass through hyper blocks
         for block in self.transformer.h:
             x = block(x)
         
@@ -92,22 +100,23 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
 
         if targets is not None:
-            # If we are given some desired targets also calculate the loss
+            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # Inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
 
+
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # Start with all of the candidate parameters
+        # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # Filter out those that do not require grad
+        # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
@@ -131,9 +140,13 @@ class GPT(nn.Module):
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        # No position embeddings to subtract with RoPE!
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -143,61 +156,3 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        """
-        Load pretrained GPT-2 model weights from HuggingFace
-        """
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}
-        
-        # Only dropout can be overridden
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print(f"loading weights from pretrained gpt: {model_type}")
-
-        # Map model type to size
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280),
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
-        }[model_type]
-        
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
-        config_args['bias'] = True
-        config_args['dropout'] = 0.0
-        if 'dropout' in override_args:
-            config_args['dropout'] = override_args['dropout']
-        
-        # Create our model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
-
-        # Load HF model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # Copy weights that match (will skip wpe since we don't have it)
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        
-        print(f"Copying matching weights (skipping wpe and modified modules)...")
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            elif k in sd:
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
