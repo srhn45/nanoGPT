@@ -13,6 +13,7 @@ import math
 
 from model import GPTConfig, GPT
 from data_loader import get_loaders
+from base import GPT as Baseline
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -44,7 +45,7 @@ dropout = 0.1
 bias = False
 
 # adamw optimizer
-learning_rate = 6e-5
+learning_rate = 6e-4
 max_iters = 20000
 weight_decay = 1e-1
 beta1 = 0.9
@@ -125,16 +126,16 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 256
     print(f"Using vocab_size = {model_args['vocab_size']} for enwik8 dataset")
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = Baseline(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'base_ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = Baseline(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
@@ -146,7 +147,7 @@ elif init_from == 'resume':
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    model = Baseline.from_pretrained(init_from, override_args)
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
 else:
@@ -292,7 +293,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(out_dir, 'base_ckpt.pt'))
     
     if iter_num == 0 and eval_only:
         break

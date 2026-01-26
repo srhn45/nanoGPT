@@ -66,8 +66,6 @@ def apply_rotary_pos_emb(x, cos, sin):
     # Split x into two halves along the head dimension
     x1, x2 = x.chunk(2, dim=-1)
     
-    # Apply rotation
-    # Reshape cos/sin to broadcast correctly
     cos = cos.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1, head_dim)
     sin = sin.unsqueeze(0).unsqueeze(2)
     
@@ -79,18 +77,14 @@ def apply_rotary_pos_emb(x, cos, sin):
 
 
 class CausalSelfAttention(nn.Module):
-    """
-    Multi-head causal self-attention with optional Flash Attention v2.
-    """
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         
-        # Key, query, value projections for all heads
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # Output projection
+
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # Regularization
+
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
@@ -146,34 +140,24 @@ class CausalSelfAttention(nn.Module):
             
             y = y.transpose(1, 2)
         
-        # Re-assemble all head outputs side by side
         y = y.contiguous().view(B, T, C)
-        
-        # Output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
 
 
 class SwiGLU(nn.Module):
-    """
-    SwiGLU activation function.
-    """
     def __init__(self, config, hidden_factor=None):
         super().__init__()
         
         if hidden_factor is None:
             # Use 8/3 ratio like LLaMA
             hidden_dim = int(2 * config.n_embd * 2 / 3)
-            # Round to nearest multiple of 256 for efficiency
-            hidden_dim = 256 * ((hidden_dim + 255) // 256)
+            hidden_dim = 256 * ((hidden_dim + 255) // 256) # Round to nearest multiple of 256
         else:
             hidden_dim = int(config.n_embd * hidden_factor)
         
-        # Gate projection (for Swish activation)
         self.w_gate = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        # Up projection (for element-wise multiplication)
         self.w_up = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        # Down projection
         self.w_down = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
         
         self.dropout = nn.Dropout(config.dropout)
@@ -190,7 +174,7 @@ class SwiGLU(nn.Module):
 
 class MLP(nn.Module):
     """
-    Standard MLP with GELU
+    Legacy
     """
     def __init__(self, config):
         super().__init__()
@@ -208,7 +192,6 @@ class MLP(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
     def __init__(self, ndim, bias=False, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
